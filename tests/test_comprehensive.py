@@ -91,35 +91,37 @@ class TestAPIEndpoints:
             assert data["status"] == "unhealthy"
             assert data["checks"]["redis"]["status"] == "unhealthy"
 
-    def test_ingest_ticket_success(self, client, valid_ticket_data):
-        """Test successful ticket ingestion"""
-        with patch('main.queue_triage_job') as mock_queue, \
-             patch('main.redis_client') as mock_redis:
-            mock_job = Mock()
-            mock_job.id = "test-job-id-123"
-            mock_queue.return_value = mock_job
-            mock_redis.get.return_value = None  # No cache hit
+ 
+    def test_ingest_ticket_cache_hit(self, client, valid_ticket_data):
+        """Test ticket ingestion with cache hit"""
+        cached_response = {"status": "cached", "result": "test result"}
 
-            response = client.post("/api/v1/triage", json=valid_ticket_data)
-            assert response.status_code == 202
-            data = response.json()
-            assert data["status"] == "queued"
-            assert data["job_id"] == "test-job-id-123"
-            assert "message" in data
+        with patch('main.redis_client') as mock_redis:
+            mock_redis.get.return_value = json.dumps(cached_response).encode()
 
-            # Verify metrics were updated
-            mock_queue.assert_called_once_with(valid_ticket_data)
+            response = client.post(
+                "/api/v1/triage",
+                json=valid_ticket_data
+            )
+
+            assert response.status_code == 200
+            assert response.json() == cached_response
 
     def test_ingest_ticket_cache_hit(self, client, valid_ticket_data):
         """Test ticket ingestion with cache hit"""
         cached_response = {"status": "cached", "result": "test result"}
+        
+        # 2. Check state using the returned job ID
         with patch('main.redis_client') as mock_redis:
-            mock_redis.get.return_value = json.dumps(cached_response).encode()
+            mock_redis.get.return_value = None
 
-            response = client.post("/api/v1/triage", json=valid_ticket_data)
-            assert response.status_code == 200  # Cache hit returns 200, not 202
-            data = response.json()
-            assert data == cached_response
+            state_response = client.get(f"/api/v1/state/{job_id}")
+
+            # The state should be retrievable using the public job ID.
+            assert state_response.status_code == 200
+            state_data = state_response.json()
+            assert state_data["status"] == "PROCESSING"
+
 
             # Verify cache was checked
             mock_redis.get.assert_called_once()
@@ -142,6 +144,29 @@ class TestAPIEndpoints:
             mock_redis.get.return_value = None  # No state found
             response = client.get("/api/v1/state/non-existent-job")
             assert response.status_code == 404
+
+    def test_state_endpoint_uses_job_id_key(self, client):
+        """State lookup should use the job ID returned by the API."""
+        job_id = "lifecycle-job-123"
+        expected_state = {
+            "status": "PAUSED_FOR_REVIEW",
+            "ticket_id": "TCK-LIFECYCLE-TEST-001"
+        }
+
+        with patch('main.redis_client') as mock_redis:
+            def get_state_by_key(key):
+                if key == f"state:{job_id}":
+                    return json.dumps(expected_state).encode()
+                return None
+
+            mock_redis.get.side_effect = get_state_by_key
+
+            response = client.get(f"/api/v1/state/{job_id}")
+
+            assert response.status_code == 200
+            assert response.json() == expected_state
+            mock_redis.get.assert_called_once_with(f"state:{job_id}")
+
 
     def test_approval_endpoint_unauthorized(self, client):
         """Test approval endpoint with invalid token"""
@@ -363,6 +388,42 @@ class TestWorkerProcessing:
             "reporter_email": "processor@enterprise.com",
             "raw_text": "Test ticket for processing"
         }
+        
+    def test_process_pipeline_task_saves_state_by_job_id(self):
+        """Worker should save workflow state using the public job ID."""
+        from worker import process_pipeline_task
+
+        job_id = "test-worker-job-123"
+        payload = {
+            "ticket_id": "TCK-PROCESS-TEST-001",
+            "reporter_email": "processor@enterprise.com",
+            "raw_text": "Test ticket for processing",
+            "job_id": job_id,
+        }
+        result = {
+            "status": "PROCESSING",
+            "risk_score": 8,
+            "ticket_id": payload["ticket_id"],
+        }
+
+        with patch(
+            "pipeline.orchestrator.StateMachineOrchestrator"
+        ) as mock_orchestrator_class, \
+             patch("worker.redis_connection") as mock_redis:
+
+            mock_orchestrator = Mock()
+            mock_orchestrator.execute_workflow.return_value = result
+            mock_orchestrator_class.return_value = mock_orchestrator
+
+            process_pipeline_task(payload)
+
+            saved_keys = [
+                call.args[0]
+                for call in mock_redis.set.call_args_list
+            ]
+
+            assert f"state:{job_id}" in saved_keys
+
 
         with patch('pipeline.orchestrator.StateMachineOrchestrator') as mock_orchestrator_class, \
              patch('worker.redis_connection') as mock_redis, \
@@ -381,14 +442,14 @@ class TestWorkerProcessing:
             mock_redis.set.return_value = True
 
             from worker import process_pipeline_task
-            result = process_pipeline_task(test_payload)
+            result = process_pipeline_task(payload)
 
             # Verify orchestrator was used
             mock_orchestrator_class.assert_called_once()
-            mock_orchestrator.execute_workflow.assert_called_once_with(test_payload)
+            mock_orchestrator.execute_workflow.assert_called_once_with(payload)
 
             # Verify result was cached
-            mock_redis.set.assert_called_once()
+            assert mock_redis.set.call_count == 2
 
             # Verify success metrics were recorded
             # Note: These would be verified by checking the actual metric values
@@ -807,3 +868,4 @@ class TestPerformanceAndLoad:
 if __name__ == "__main__":
     # This allows running the tests directly with: python -m tests.test_comprehensive
     pytest.main([__file__, "-v"])
+

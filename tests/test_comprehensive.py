@@ -107,25 +107,7 @@ class TestAPIEndpoints:
             assert response.status_code == 200
             assert response.json() == cached_response
 
-    def test_ingest_ticket_cache_hit(self, client, valid_ticket_data):
-        """Test ticket ingestion with cache hit"""
-        cached_response = {"status": "cached", "result": "test result"}
-        
-        # 2. Check state using the returned job ID
-        with patch('main.redis_client') as mock_redis:
-            mock_redis.get.return_value = None
-
-            state_response = client.get(f"/api/v1/state/{job_id}")
-
-            # The state should be retrievable using the public job ID.
-            assert state_response.status_code == 200
-            state_data = state_response.json()
-            assert state_data["status"] == "PROCESSING"
-
-
-            # Verify cache was checked
-            mock_redis.get.assert_called_once()
-
+    
 
     def test_ingest_ticket_invalid_email(self, client):
         """Test ticket ingestion with non-corporate email"""

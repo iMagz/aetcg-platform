@@ -153,9 +153,15 @@ Response example:
 {
   "status": "queued",
   "job_id": "<job-id>",
-  "message": "Ticket verification initiated."
+  "message": "Ticket verification initiated.",
+  "result": null
 }
 ```
+
+Duplicate requests with a cached result return HTTP `200` with the same fields:
+`status` is `"cached"`, `job_id` is `null`, and `result` contains the cached workflow
+state. Cache entries expire after 600 seconds; once expired, the request is queued
+again and receives the same response shape as a new submission.
 
 Check the state of a queued job:
 

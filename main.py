@@ -4,12 +4,13 @@ import json
 import re
 import threading
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from config.settings import settings
 from pipeline.validation import TicketIngestionSchema
+from app.cache import ticket_cache_key
 from worker import queue_triage_job
 import redis
 from app.metrics import (
@@ -252,6 +253,21 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
+
+def _triage_response(
+    response_status: str,
+    job_id: Optional[str],
+    message: str,
+    result: Any,
+) -> Dict[str, Any]:
+    return {
+        "status": response_status,
+        "job_id": job_id,
+        "message": message,
+        "result": result,
+    }
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     """Add security headers to responses"""
@@ -265,7 +281,7 @@ async def add_security_headers(request: Request, call_next):
 @app.post("/api/v1/triage", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
     start_time = time.time()
-    payload_hash = hash(payload.raw_text)
+    cache_key = ticket_cache_key(payload.raw_text)
 
     # Extract request information for metrics and logging
     client_ip = request.client.host if request.client else "unknown"
@@ -274,7 +290,7 @@ async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
     http_version = request.scope.get("http_version", "1.1")
 
     # Milestone 6: Optimization / Query Caching Layer
-    cached_result = redis_client.get(f"cache:{payload_hash}")
+    cached_result = redis_client.get(cache_key)
     if cached_result:
         # Record cache hit metrics
         increment_counter(CACHE_HITS_TOTAL, {"cache_type": "redis"})
@@ -284,7 +300,15 @@ async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
             "latency_ms": (time.time() - start_time) * 1000,
             "client_ip": client_ip
         }))
-        return JSONResponse(content=json.loads(cached_result), status_code=status.HTTP_200_OK)
+        return JSONResponse(
+            content=_triage_response(
+                "cached",
+                None,
+                "Cached ticket result returned.",
+                json.loads(cached_result),
+            ),
+            status_code=status.HTTP_200_OK,
+        )
     else:
         # Record cache miss
         increment_counter(CACHE_MISSES_TOTAL, {"cache_type": "redis"})
@@ -300,9 +324,9 @@ async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
         if clean_text != payload.raw_text:
             payload.raw_text = clean_text
             # Re-hash the sanitized payload
-            payload_hash = hash(payload.raw_text)
+            cache_key = ticket_cache_key(payload.raw_text)
             # Check cache again with sanitized payload
-            cached_result = redis_client.get(f"cache:{payload_hash}")
+            cached_result = redis_client.get(cache_key)
             if cached_result:
                 # Record cache hit after sanitization
                 increment_counter(CACHE_HITS_TOTAL, {"cache_type": "redis"})
@@ -312,7 +336,15 @@ async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
                     "latency_ms": (time.time() - start_time) * 1000,
                     "client_ip": client_ip
                 }))
-                return json.loads(cached_result)
+                return JSONResponse(
+                    content=_triage_response(
+                        "cached",
+                        None,
+                        "Cached ticket result returned.",
+                        json.loads(cached_result),
+                    ),
+                    status_code=status.HTTP_200_OK,
+                )
         else:
             # Record cache miss after sanitization check
             increment_counter(CACHE_MISSES_TOTAL, {"cache_type": "redis"})
@@ -332,7 +364,12 @@ async def ingest_ticket(request: Request, payload: TicketIngestionSchema):
             "latency_ms": (time.time() - start_time) * 1000,
             "client_ip": client_ip
         }))
-        return {"status": "queued", "job_id": job.id, "message": "Ticket verification initiated."}
+        return _triage_response(
+            "queued",
+            job.id,
+            "Ticket verification initiated.",
+            None,
+        )
 
     except Exception as e:
         # Record ingestion failure metrics

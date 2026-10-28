@@ -1,3 +1,5 @@
+import threading
+import uuid
 import json
 import logging
 import time
@@ -53,6 +55,13 @@ def process_pipeline_task(payload: dict):
         orchestrator = StateMachineOrchestrator()
         result = orchestrator.execute_workflow(payload)
 
+               # Persist final state (COMPLETED or PAUSED_FOR_REVIEW) under the job_id the
+        # API returned, so GET /state/{job_id} and PUT /approve/{job_id} work.
+        if payload.get("job_id"):
+            redis_connection.set(
+                f"state:{payload['job_id']}",
+                json.dumps({**result, "job_id": payload["job_id"]}),
+            )
         # Record successful processing metrics
         processing_time = time.time() - start_time
         observe_histogram(TICKET_PROCESSING_TIME_SECONDS, processing_time, {"status": "success"})
@@ -109,7 +118,8 @@ def process_pipeline_task(payload: dict):
 def queue_triage_job(payload: dict):
     # Record job enqueue metrics
     increment_counter(TICKET_INGESTION_TOTAL, {"status": "queued"})
-    job = task_queue.enqueue(process_pipeline_task, payload)
+    job_id = uuid.uuid4().hex
+    job = task_queue.enqueue(process_pipeline_task, {**payload, "job_id": job_id}, job_id=job_id)
 
     # Update queue depth gauge (approximate - in practice you'd get this from Redis)
     # For simplicity, we'll increment/decrement based on enqueue/dequeue

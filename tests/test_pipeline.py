@@ -18,7 +18,7 @@ def test_pydantic_corporate_domain_enforcement():
     with pytest.raises(ValueError, match="Ingestion restricted to internal corporate system users."):
         TicketIngestionSchema(**invalid_data)
 
-def test_regex_pii_scrubbing_pipeline():
+def test_regex_pii_scrubbing_pipeline(): #Test3
     pipeline = DataSanitizationPipeline(dlq_path="tests/mock_dlq.log")
     dirty_text = "Urgent: Customer identity verification details matched SSN: 000-12-3456 profile."
 

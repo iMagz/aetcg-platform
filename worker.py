@@ -7,6 +7,7 @@ import threading
 from redis import Redis
 from rq import Queue, Worker
 from config.settings import settings
+from app.cache import ticket_cache_key
 from app.metrics import (
     increment_counter,
     observe_histogram,
@@ -84,12 +85,13 @@ def process_pipeline_task(payload: dict):
                     increment_counter(COMPLIANCE_FAIL_TOTAL)
 
         # Cache the final state result for API lookup
-        redis_connection.set(f"cache:{hash(payload['raw_text'])}", json.dumps(result), ex=600)
+        cache_key = ticket_cache_key(payload["raw_text"])
+        redis_connection.set(cache_key, json.dumps(result), ex=600)
 
         logger.info(json.dumps({
             "event": "task_processed_successfully",
             "processing_time_ms": processing_time * 1000,
-            "payload_hash": hash(payload['raw_text'])
+            "cache_key": cache_key
         }))
         return result
 
@@ -104,7 +106,7 @@ def process_pipeline_task(payload: dict):
             "event": "task_processing_failed",
             "error": str(e),
             "processing_time_ms": processing_time * 1000,
-            "payload_hash": hash(payload['raw_text'])
+            "cache_key": ticket_cache_key(payload["raw_text"])
         }))
         raise
 

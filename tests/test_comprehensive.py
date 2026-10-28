@@ -99,13 +99,15 @@ class TestAPIEndpoints:
         with patch('main.redis_client') as mock_redis:
             mock_redis.get.return_value = json.dumps(cached_response).encode()
 
-            response = client.post(
-                "/api/v1/triage",
-                json=valid_ticket_data
-            )
-
+            response = client.post("/api/v1/triage", json=valid_ticket_data)
             assert response.status_code == 200
-            assert response.json() == cached_response
+            data = response.json()
+            assert data == {
+                "status": "cached",
+                "job_id": None,
+                "message": "Cached ticket result returned.",
+                "result": cached_response,
+            }
 
     
 
@@ -672,45 +674,51 @@ class TestIntegrationScenarios:
                     assert data["status"] == "queued"
 
     def test_cache_behavior(self, client):
-        """Test caching behavior for duplicate tickets"""
+        """A duplicate has the same response shape, and expiration queues again."""
         ticket_data = {
             "ticket_id": "TCK-CACHE-TEST-001",
             "reporter_email": "cache@enterprise.com",
             "raw_text": "This ticket should be cached"
         }
-
-        # Mock the cache to return a value on second call
-        call_count = 0
-        def mock_get_side_effect(key):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return None  # First call - cache miss
-            else:
-                return json.dumps({"cached": "result", "data": "test"}).encode()  # Second call - cache hit
+        cached_result = {
+            "ticket_id": ticket_data["ticket_id"],
+            "status": "COMPLETED",
+            "risk_score": 2,
+        }
 
         with patch('main.redis_client') as mock_redis:
-            mock_redis.get.side_effect = mock_get_side_effect
-            mock_redis.set.return_value = True
-
-            # First request - should miss cache and enqueue job
+            mock_redis.get.side_effect = [
+                None,
+                json.dumps(cached_result).encode(),
+                None,
+            ]
             with patch('main.queue_triage_job') as mock_queue:
-                mock_job = Mock()
-                mock_job.id = "cache-job-123"
-                mock_queue.return_value = mock_job
+                mock_queue.side_effect = [
+                    Mock(id="cache-job-first"),
+                    Mock(id="cache-job-after-expiration"),
+                ]
 
-                response1 = client.post("/api/v1/triage", json=ticket_data)
-                assert response1.status_code == 202
-                # Should have enqueued a job (cache miss)
-                mock_queue.assert_called_once()
+                first = client.post("/api/v1/triage", json=ticket_data)
+                duplicate = client.post("/api/v1/triage", json=ticket_data)
+                after_expiration = client.post("/api/v1/triage", json=ticket_data)
 
-            # Second request - should hit cache and return cached result
-            response2 = client.post("/api/v1/triage", json=ticket_data)
-            assert response2.status_code == 200
-            data2 = response2.json()
-            assert data2["cached"] == "result"
-            # Should NOT have enqueued another job (cache hit)
-            assert mock_queue.call_count == 1  # Still only called once
+                assert [first.status_code, duplicate.status_code, after_expiration.status_code] == [
+                    202, 200, 202
+                ]
+                first_data = first.json()
+                duplicate_data = duplicate.json()
+                expired_data = after_expiration.json()
+                expected_keys = {"status", "job_id", "message", "result"}
+                assert set(first_data) == set(duplicate_data) == set(expired_data) == expected_keys
+                assert first_data["status"] == "queued"
+                assert first_data["job_id"] == "cache-job-first"
+                assert first_data["result"] is None
+                assert duplicate_data["status"] == "cached"
+                assert duplicate_data["result"] == cached_result
+                assert expired_data["status"] == "queued"
+                assert expired_data["job_id"] == "cache-job-after-expiration"
+                assert expired_data["result"] is None
+                assert mock_queue.call_count == 2
 
     def test_sanitization_effects(self, client):
         """Test that input sanitization works correctly"""
@@ -850,4 +858,3 @@ class TestPerformanceAndLoad:
 if __name__ == "__main__":
     # This allows running the tests directly with: python -m tests.test_comprehensive
     pytest.main([__file__, "-v"])
-
